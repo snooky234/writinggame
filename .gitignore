@@ -8,3 +8,6 @@ wheels/
 
 # Virtual environments
 .venv
+
+audio_cache
+piper

@@ -1,6 +1,9 @@
 from nicegui import ui
 import random
 import asyncio
+import subprocess
+import os
+from pathlib import Path
 
 # Wortspeicher mit drei Schwierigkeitsgraden
 WORT_SPEICHER = {
@@ -22,35 +25,69 @@ class LeselernApp:
         self.timer_task = None
         self.verbleibende_zeit = 60
         self.spiel_laeuft = False
+        self.audio_cache_dir = Path('audio_cache')
+        self.audio_cache_dir.mkdir(exist_ok=True)
         
+    def generiere_audio_mit_piper(self, text: str) -> str:
+        """Generiert Audio mit Piper TTS und gibt Dateipfad zurück"""
+        filename = f"{text.lower()}.wav"
+        filepath = self.audio_cache_dir / filename
+        
+        if filepath.exists():
+            return str(filepath)
+        
+        try:
+            # Windows: piper.exe im Projektverzeichnis
+            piper_exe = r'C:\Users\dontp\Documents\git\writinggame\piper\piper.exe'
+            model_path = r'C:\Users\dontp\Documents\git\writinggame\piper\de_DE-thorsten-low.onnx'
+            
+            # Prüfe ob Dateien existieren
+            if not Path(piper_exe).exists():
+                print(f"❌ piper.exe nicht gefunden: {piper_exe}")
+                return None
+            
+            if not Path(model_path).exists():
+                print(f"❌ Model nicht gefunden: {model_path}")
+                print("Bitte herunterladen von:")
+                print("https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/low/de_DE-thorsten-low.onnx")
+                return None
+            
+            process = subprocess.Popen([
+                piper_exe,
+                '--model', model_path,
+                '--output_file', str(filepath)
+            ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            stdout, stderr = process.communicate(input=text.encode('utf-8'))
+            
+            if process.returncode == 0:
+                print(f"✓ Audio generiert: {filepath}")
+                return str(filepath)
+            else:
+                print(f"❌ Piper TTS Fehler (returncode {process.returncode}):")
+                print(f"STDOUT: {stdout.decode()}")
+                print(f"STDERR: {stderr.decode()}")
+                return None
+                
+        except FileNotFoundError as e:
+            print(f"❌ Datei nicht gefunden: {e}")
+            return None
+        except Exception as e:
+            print(f"❌ Fehler bei Audio-Generierung: {e}")
+            return None
+    
     def spreche_wort_sync(self, wort):
-        """Spricht das Wort mit Browser Speech Synthesis aus (synchron)"""
+        """Spielt Audio mit Piper TTS ab"""
         if not wort:
             return
-        try:
+        
+        audio_path = self.generiere_audio_mit_piper(wort)
+        if audio_path:
+            # Audio im Browser abspielen
             ui.run_javascript(f'''
-                (function() {{
-                    const text = "{wort.lower()}";
-                    console.log("Spreche:", text);
-                    
-                    if (typeof speechSynthesis === 'undefined') {{
-                        console.error("Speech Synthesis nicht verfügbar!");
-                        return;
-                    }}
-                    
-                    speechSynthesis.cancel();
-                    
-                    const utterance = new SpeechSynthesisUtterance(text);
-                    utterance.lang = 'de-DE';
-                    utterance.rate = 0.8;
-                    utterance.pitch = 1.0;
-                    utterance.volume = 1.0;
-                    
-                    speechSynthesis.speak(utterance);
-                }})();
+                const audio = new Audio('/audio_cache/{Path(audio_path).name}');
+                audio.play().catch(e => console.error('Audio playback error:', e));
             ''')
-        except Exception as e:
-            print(f"Speech Synthesis Fehler: {e}")
     
     async def spreche_wort(self, wort):
         """Spricht das Wort mit Browser Speech Synthesis aus (async für Test-Button)"""
@@ -290,5 +327,11 @@ def startseite():
 @ui.page('/spiel')
 def spielseite():
     app.erstelle_spielseite()
+
+# Audio-Cache als statisches Verzeichnis registrieren
+from starlette.staticfiles import StaticFiles
+from nicegui import app as nicegui_app
+
+nicegui_app.add_static_files('/audio_cache', 'audio_cache')
 
 ui.run(title='Leselern-App', port=8080)
