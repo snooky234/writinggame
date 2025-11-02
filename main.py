@@ -2,336 +2,313 @@ from nicegui import ui
 import random
 import asyncio
 import subprocess
-import os
+import json
 from pathlib import Path
+from image_generator import ImageGenerator
+from words import WOERTER, ALPHABET
 
-# Wortspeicher mit drei Schwierigkeitsgraden
-WORT_SPEICHER = {
-    1: ['AUTO', 'NASE', 'HASE', 'TASSE', 'DOSE', 'ROSE', 'SONNE', 'MOND', 'FUSS', 'HAND'],
-    2: ['SCHUBLADE', 'TASCHENTUCH', 'REGENBOGEN', 'SANDKASTEN', 'BLUMENTOPF', 'HANDSCHUH', 
-        'SCHULBUS', 'APFELBAUM', 'KAUFHAUS', 'TURNSCHUH'],
-    3: ['GITARRE', 'TABLETT', 'TRITTLEITER', 'VÖGEL', 'MÄHNE', 'KÄFIG', 'KÖNIGIN', 
-        'PHYSIK', 'YACHT', 'RHYTHMUS']
-}
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-# Alphabet mit Umlauten
-ALPHABET = list('ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÜ')
+# Woerter nach Schwierigkeitsgrad
 
-class LeselernApp:
+class ReadingApp:
     def __init__(self):
         self.aktuelles_wort = ''
         self.geschriebenes_wort = ''
-        self.schwierigkeitsgrad = 1
-        self.timer_task = None
-        self.verbleibende_zeit = 60
         self.spiel_laeuft = False
-        self.audio_cache_dir = Path('audio_cache')
-        self.audio_cache_dir.mkdir(exist_ok=True)
-        
-    def generiere_audio_mit_piper(self, text: str) -> str:
-        """Generiert Audio mit Piper TTS und gibt Dateipfad zurück"""
-        filename = f"{text.lower()}.wav"
-        filepath = self.audio_cache_dir / filename
-        
+        self.verbleibende_zeit = 60
+        self.timer_task = None
+        self.audio_cache = Path('audio_cache')
+        self.audio_cache.mkdir(exist_ok=True)
+        self.image_generator = ImageGenerator()
+        self.bild_container = None
+        self.bild_timer = None
+        # Piper voice configuration: model path and slower speaking rate
+        self.tts_model_path = Path('piper/de_DE-thorsten_emotional-medium.onnx')
+        # self.tts_model_path = Path('piper/de_DE-thorsten-medium.onnx')
+        self.tts_length_scale = 2
+        self.tts_speaker = 7
+        self.erfolgsaussagen = [
+            'Super',
+            'gut gemacht',
+            'Perfekt',
+            'Toll gemacht',
+            'Das war gut!'
+        ]
+
+    def generiere_audio(self, text: str) -> str:
+        """Generates audio with Piper TTS"""
+        model_path = self.tts_model_path
+        voice_id = model_path.stem
+        scale_tag = f"ls{self.tts_length_scale}".replace('.', '_')
+        speaker_value = str(self.tts_speaker) if self.tts_speaker is not None else 'default'
+        safe_speaker = speaker_value.replace('/', '_').replace(' ', '-')
+        filepath = self.audio_cache / (
+            f"{voice_id}_{safe_speaker}_{scale_tag}_{text.lower()}.wav"
+        )
         if filepath.exists():
             return str(filepath)
         
         try:
-            # Windows: piper.exe im Projektverzeichnis
-            piper_exe = r'C:\Users\dontp\Documents\git\writinggame\piper\piper.exe'
-            model_path = r'C:\Users\dontp\Documents\git\writinggame\piper\de_DE-thorsten-low.onnx'
+            piper_exe = Path('piper/piper.exe')
             
-            # Prüfe ob Dateien existieren
-            if not Path(piper_exe).exists():
-                print(f"❌ piper.exe nicht gefunden: {piper_exe}")
+            if not piper_exe.exists() or not model_path.exists():
+                print(f"Error: Piper or model not found")
                 return None
             
-            if not Path(model_path).exists():
-                print(f"❌ Model nicht gefunden: {model_path}")
-                print("Bitte herunterladen von:")
-                print("https://huggingface.co/rhasspy/piper-voices/resolve/main/de/de_DE/thorsten/low/de_DE-thorsten-low.onnx")
-                return None
-            
-            process = subprocess.Popen([
-                piper_exe,
-                '--model', model_path,
-                '--output_file', str(filepath)
-            ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            
+            command = [
+                str(piper_exe),
+                '--model', str(model_path),
+                '--output_file', str(filepath),
+                '--length_scale', str(self.tts_length_scale),
+            ]
+            if self.tts_speaker is not None:
+                speaker_value = str(self.tts_speaker)
+                option = '--speaker-id' if isinstance(self.tts_speaker, int) or speaker_value.isdigit() else '--speaker'
+                command.extend([option, speaker_value])
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
             stdout, stderr = process.communicate(input=text.encode('utf-8'))
             
             if process.returncode == 0:
-                print(f"✓ Audio generiert: {filepath}")
                 return str(filepath)
-            else:
-                print(f"❌ Piper TTS Fehler (returncode {process.returncode}):")
-                print(f"STDOUT: {stdout.decode()}")
-                print(f"STDERR: {stderr.decode()}")
-                return None
-                
-        except FileNotFoundError as e:
-            print(f"❌ Datei nicht gefunden: {e}")
+            print(f"Error: Piper failed: {stderr.decode()}")
             return None
         except Exception as e:
-            print(f"❌ Fehler bei Audio-Generierung: {e}")
+            print(f"Error: Audio generation failed: {e}")
             return None
     
-    def spreche_wort_sync(self, wort):
-        """Spielt Audio mit Piper TTS ab"""
+    def spreche_wort(self, wort):
+        """Spielt Audio ab"""
         if not wort:
             return
-        
-        audio_path = self.generiere_audio_mit_piper(wort)
+        audio_path = self.generiere_audio(wort)
         if audio_path:
-            # Audio im Browser abspielen
-            ui.run_javascript(f'''
-                const audio = new Audio('/audio_cache/{Path(audio_path).name}');
-                audio.play().catch(e => console.error('Audio playback error:', e));
-            ''')
-    
-    async def spreche_wort(self, wort):
-        """Spricht das Wort mit Browser Speech Synthesis aus (async für Test-Button)"""
-        if not wort:
-            return
-        try:
-            result = await ui.run_javascript(f'''
-                return new Promise((resolve) => {{
-                    const text = "{wort.lower()}";
-                    console.log("=== Spreche:", text, "===");
-                    
-                    // Prüfe Speech Synthesis Verfügbarkeit
-                    if (typeof speechSynthesis === 'undefined') {{
-                        console.error("❌ speechSynthesis ist nicht definiert!");
-                        alert("Speech Synthesis ist in diesem Browser nicht verfügbar!");
-                        resolve(false);
-                        return;
-                    }}
-                    
-                    console.log("✓ speechSynthesis ist verfügbar");
-                    
-                    // Warte auf Stimmen zu laden
-                    let voices = speechSynthesis.getVoices();
-                    console.log("Verfügbare Stimmen:", voices.length);
-                    
-                    const speakNow = () => {{
-                        voices = speechSynthesis.getVoices();
-                        console.log("Jetzt verfügbare Stimmen:", voices.length);
-                        
-                        speechSynthesis.cancel();
-                        
-                        const utterance = new SpeechSynthesisUtterance(text);
-                        
-                        // Suche deutsche Stimme
-                        const germanVoice = voices.find(v => v.lang.startsWith('de'));
-                        if (germanVoice) {{
-                            console.log("✓ Deutsche Stimme gefunden:", germanVoice.name);
-                            utterance.voice = germanVoice;
-                        }} else {{
-                            console.log("⚠ Keine deutsche Stimme, nutze Standard");
+            audio_url = f"/audio_cache/{Path(audio_path).name}"
+            script = f'''
+                window.__audioQueue = window.__audioQueue || (function() {{
+                    const state = {{ queue: [], playing: false }};
+                    state.playNext = function() {{
+                        if (!state.queue.length) {{
+                            state.playing = false;
+                            return;
                         }}
-                        
-                        utterance.lang = 'de-DE';
-                        utterance.rate = 0.8;
-                        utterance.pitch = 1.0;
-                        utterance.volume = 1.0;
-                        
-                        utterance.onstart = () => {{
-                            console.log("✓✓✓ Speech GESTARTET ✓✓✓");
-                        }};
-                        
-                        utterance.onend = () => {{
-                            console.log("✓ Speech beendet");
-                            resolve(true);
-                        }};
-                        
-                        utterance.onerror = (e) => {{
-                            console.error("❌ Speech error:", e.error, e);
-                            alert("Speech Error: " + e.error);
-                            resolve(false);
-                        }};
-                        
-                        console.log(">>> Rufe speak() auf...");
-                        speechSynthesis.speak(utterance);
-                        console.log(">>> speak() aufgerufen");
+                        state.playing = true;
+                        const src = state.queue.shift();
+                        const audio = new Audio(src);
+                        audio.addEventListener('ended', state.playNext);
+                        audio.addEventListener('error', state.playNext);
+                        audio.play().catch(err => {{
+                            console.error('Audio error:', err);
+                            state.playNext();
+                        }});
                     }};
-                    
-                    // Wenn keine Stimmen verfügbar, warte darauf
-                    if (voices.length === 0) {{
-                        console.log("Warte auf Stimmen...");
-                        speechSynthesis.onvoiceschanged = () => {{
-                            console.log("Stimmen geladen!");
-                            speakNow();
-                        }};
-                    }} else {{
-                        speakNow();
-                    }}
-                }});
-            ''')
-            print(f"Speech Synthesis Ergebnis: {result}")
-        except Exception as e:
-            print(f"Speech Synthesis Fehler: {e}")
+                    state.enqueue = function(src) {{
+                        state.queue.push(src);
+                        if (!state.playing) {{
+                            state.playNext();
+                        }}
+                    }};
+                    return state;
+                }})();
+                window.__audioQueue.enqueue({json.dumps(audio_url)});
+            '''
+            ui.run_javascript(script)
     
     def buchstabe_hinzufuegen(self, buchstabe):
-        """Fügt einen Buchstaben zum geschriebenen Wort hinzu"""
+        """Fügt Buchstaben hinzu"""
         if not self.spiel_laeuft:
             return
         self.geschriebenes_wort += buchstabe
-        self.aktualisiere_wortanzeige()
-        self.spreche_wort_sync(self.geschriebenes_wort)
-        self.pruefe_wort()
-    
-    def buchstabe_entfernen(self, index):
-        """Entfernt einen Buchstaben aus dem geschriebenen Wort"""
-        if not self.spiel_laeuft or index >= len(self.geschriebenes_wort):
-            return
-        self.geschriebenes_wort = self.geschriebenes_wort[:index] + self.geschriebenes_wort[index+1:]
-        self.aktualisiere_wortanzeige()
-        self.spreche_wort_sync(self.geschriebenes_wort)
-    
-    def aktualisiere_wortanzeige(self):
-        """Aktualisiert die Anzeige des geschriebenen Wortes"""
-        self.buchstaben_container.clear()
-        with self.buchstaben_container:
-            if self.geschriebenes_wort:
-                for i, buchstabe in enumerate(self.geschriebenes_wort):
-                    ui.button(buchstabe, 
-                            on_click=lambda idx=i: self.buchstabe_entfernen(idx)).classes(
-                        'text-2xl w-12 h-12 bg-gray-300 hover:bg-red-300')
-    
-    def pruefe_wort(self):
-        """Prüft ob das Wort korrekt geschrieben wurde"""
-        print(f"Prüfe: '{self.geschriebenes_wort}' == '{self.aktuelles_wort}'")
+        self.aktualisiere_anzeige()
+        self.spreche_wort(self.geschriebenes_wort)
+        
+        # Prüfe ob Wort korrekt
         if self.geschriebenes_wort == self.aktuelles_wort:
-            print("WORT IST RICHTIG! Spiel gewonnen!")
             self.spiel_gewonnen()
     
+    def buchstabe_entfernen(self, index):
+        """Entfernt Buchstaben"""
+        if not self.spiel_laeuft:
+            return
+        self.geschriebenes_wort = (self.geschriebenes_wort[:index] + 
+                                   self.geschriebenes_wort[index+1:])
+        self.aktualisiere_anzeige()
+        self.spreche_wort(self.geschriebenes_wort)
+    
+    def aktualisiere_anzeige(self):
+        """Aktualisiert Buchstaben-Anzeige"""
+        self.buchstaben_container.clear()
+        with self.buchstaben_container:
+            for i, buchstabe in enumerate(self.geschriebenes_wort):
+                ui.button(buchstabe, on_click=lambda idx=i: self.buchstabe_entfernen(idx)
+                         ).classes('text-2xl w-12 h-12 bg-gray-300 hover:bg-red-300')
+    
+    def pruefe_bild_verfuegbar(self):
+        """Checks if image is available and updates display"""
+        # Sicherheitscheck: Wenn Timer bereits None ist, nicht weitermachen
+        if self.bild_timer is None:
+            return
+            
+        bildpfad = Path(f'assets/{self.aktuelles_wort.lower()}.png')
+        if bildpfad.exists():
+            # Timer SOFORT stoppen und auf None setzen
+            if self.bild_timer:
+                self.bild_timer.active = False
+                self.bild_timer.cancel()
+                self.bild_timer = None
+            
+            # Bild nur laden wenn Container noch existiert
+            if self.bild_container:
+                self.bild_container.clear()
+                with self.bild_container:
+                    ui.image(f'assets/{self.aktuelles_wort.lower()}.png').classes(
+                        'w-96 h-96 object-contain mx-auto')
+                    
+            print(f"✓ Image loaded once: {self.aktuelles_wort}")
+    
     def spiel_gewonnen(self):
-        """Wird aufgerufen wenn das Kind gewonnen hat"""
-        print(">>> spiel_gewonnen() aufgerufen!")
+        """Gewonnen"""
         self.spiel_laeuft = False
+        
+        # Timer komplett stoppen
         if self.timer_task:
             self.timer_task.cancel()
-        
-        ui.notify('🎉 Gewonnen! Das Wort ist richtig!', type='positive', position='center', 
-                 close_button=True, timeout=3000)
-        print(">>> Starte Timer für Navigation...")
+            
+        # Bild-Timer stoppen und auf None setzen
+        if self.bild_timer:
+            self.bild_timer.active = False
+            self.bild_timer.cancel()
+            self.bild_timer = None
+
+        self.spreche_wort(random.choice(self.erfolgsaussagen))
+
+        ui.notify(' Gewonnen! 🎉', type='positive', position='center', timeout=3000, 
+             classes='text-4xl')
         ui.timer(3.0, lambda: ui.navigate.to('/'), once=True)
     
     def spiel_verloren(self):
-        """Wird aufgerufen wenn die Zeit abgelaufen ist"""
+        """Time up"""
         self.spiel_laeuft = False
-        ui.notify(f'⏰ Zeit abgelaufen! Das Wort war: {self.aktuelles_wort}', 
-                 type='negative', position='center', close_button=True, timeout=5000)
+        
+        # Bild-Timer stoppen und auf None setzen
+        if self.bild_timer:
+            self.bild_timer.active = False
+            self.bild_timer.cancel()
+            self.bild_timer = None
+            
+        ui.notify(f'⏰ Time up! The word was: {self.aktuelles_wort}', 
+                 type='negative', position='center', timeout=5000)
         ui.timer(4.0, lambda: ui.navigate.to('/'), once=True)
     
-
-    
     async def timer_countdown(self):
-        """Timer-Countdown für die Progressbar"""
+        """Timer-Countdown"""
         while self.verbleibende_zeit > 0 and self.spiel_laeuft:
             await asyncio.sleep(1)
             self.verbleibende_zeit -= 1
             self.progress.set_value(self.verbleibende_zeit / 60)
-            
         if self.spiel_laeuft:
             self.spiel_verloren()
     
     def starte_spiel(self, schwierigkeitsgrad):
-        """Startet ein neues Spiel mit dem gewählten Schwierigkeitsgrad"""
-        self.schwierigkeitsgrad = schwierigkeitsgrad
-        self.aktuelles_wort = random.choice(WORT_SPEICHER[schwierigkeitsgrad])
+        """Startet neues Spiel"""
+        self.aktuelles_wort = random.choice(WOERTER[schwierigkeitsgrad])
         self.geschriebenes_wort = ''
         self.verbleibende_zeit = 60
         self.spiel_laeuft = True
-        
+        asyncio.create_task(asyncio.to_thread(
+            self.image_generator.generate_image, self.aktuelles_wort))
         ui.navigate.to('/spiel')
     
     def erstelle_startseite(self):
-        """Erstellt den Startbildschirm"""
+        """Start screen""" 
         with ui.column().classes('w-full h-screen items-center justify-center gap-8'):
-            ui.label('Lesen Lernen').classes('text-6xl font-bold text-blue-600')
-            ui.label('Wähle einen Schwierigkeitsgrad:').classes('text-3xl')
+            ui.label('Wort Spiel').classes('text-6xl font-bold text-blue-600')
             
             with ui.row().classes('gap-8'):
-                ui.button('Leicht\n(Kurze Wörter)', 
-                         on_click=lambda: self.starte_spiel(1)).classes(
-                    'text-3xl p-8 bg-green-500 text-white rounded-xl w-64 h-32')
-                
-                ui.button('Mittel\n(Längere Wörter)', 
-                         on_click=lambda: self.starte_spiel(2)).classes(
-                    'text-3xl p-8 bg-yellow-500 text-white rounded-xl w-64 h-32')
-                
-                ui.button('Schwer\n(Schwierige Wörter)', 
-                         on_click=lambda: self.starte_spiel(3)).classes(
-                    'text-3xl p-8 bg-red-500 text-white rounded-xl w-64 h-32')
+                for level, (farbe, text) in enumerate([
+                    ('green', '👶 Leicht'),
+                    ('yellow', '👦 Mittel'),
+                    ('red', '🦸‍♀️ Schwer')
+                ], 1):
+                    ui.button(text, on_click=lambda l=level: self.starte_spiel(l)
+                             ).classes(f'text-3xl p-8 bg-{farbe}-500 text-white rounded-xl w-64 h-32')
     
     def erstelle_spielseite(self):
-        """Erstellt die Spielseite"""
+        """Game page"""
         with ui.column().classes('w-full h-screen p-4 gap-4'):
-            
-            # Speech Synthesis initialisieren beim Laden
-            ui.timer(0.1, lambda: ui.run_javascript('''
-                console.log("Speech Synthesis Test beim Laden...");
-                console.log("speechSynthesis verfügbar:", !!window.speechSynthesis);
-                if (window.speechSynthesis) {
-                    const voices = window.speechSynthesis.getVoices();
-                    console.log("Verfügbare Stimmen:", voices.length);
-                    voices.forEach(v => {
-                        if (v.lang.startsWith('de')) {
-                            console.log("Deutsche Stimme:", v.name, v.lang);
-                        }
-                    });
-                }
-            '''), once=True)
-            
-            # Buttons zum Vorlesen
+            # Audio buttons
             with ui.row().classes('w-full justify-end gap-4'):
-                ui.button('🔊 Mein Wort vorlesen', 
-                         on_click=lambda: self.spreche_wort_sync(self.geschriebenes_wort if self.geschriebenes_wort else 'nichts')).classes(
-                    'bg-purple-500 text-white text-xl px-6 py-3')
-                ui.button('🎯 Gesuchtes Wort hören', 
-                         on_click=lambda: self.spreche_wort_sync(self.aktuelles_wort)).classes(
-                    'bg-green-500 text-white text-xl px-6 py-3')
+                ui.button('🔊 Dein Wort', on_click=lambda: self.spreche_wort(
+                    self.geschriebenes_wort or 'nothing')
+                         ).classes('bg-purple-500 text-white text-xl px-6 py-3')
+                ui.button('🎯 Suchwort', on_click=lambda: self.spreche_wort(
+                    self.aktuelles_wort)
+                         ).classes('bg-green-500 text-white text-xl px-6 py-3')
             
-            # Timer Progressbar
-            self.progress = ui.linear_progress(value=1.0, size='30px').classes('w-full')
-            self.progress.props('color=blue')
+            # Timer
+            self.progress = (
+                ui.linear_progress(value=1.0, size='30px', show_value=False)
+                .props('color=blue :show-value="false"')
+                .classes('w-full')
+            )
             
-            # Bild
-            # bildpfad = f'assets/{self.aktuelles_wort.lower()}.jpg'
-            bildpfad = f'assets/apfel.jpg' # Platzhalterbild bis bilder für alle Wörter vorhanden sind
-            ui.image(bildpfad).classes('w-96 h-96 object-contain mx-auto')
+            # Image container (dynamically updated)
+            self.bild_container = ui.column().classes('w-96 h-96 mx-auto')
             
-            # Container für gewählte Buchstaben
+            bildpfad = Path(f'assets/{self.aktuelles_wort.lower()}.png')
+            if bildpfad.exists():
+                # Image already exists
+                with self.bild_container:
+                    ui.image(f'assets/{self.aktuelles_wort.lower()}.png').classes(
+                        'w-96 h-96 object-contain mx-auto')
+            else:
+                # Image still generating - loading display + timer
+                with self.bild_container:
+                    with ui.card().classes('w-96 h-96 flex items-center justify-center bg-gray-100'):
+                        ui.spinner(size='lg')
+                        ui.label('🎨 Bild erstellen...').classes('text-xl mt-4 text-gray-500')
+                
+                # Timer that checks every 0.5 seconds
+                self.bild_timer = ui.timer(0.5, self.pruefe_bild_verfuegbar)
+            
+            # Letter container
             with ui.card().classes('w-full mx-auto p-4'):
                 self.buchstaben_container = ui.row().classes('justify-center flex-wrap gap-2 min-h-14')
             
-            # Alphabet-Buttons
-            ui.label('Wähle die Buchstaben:').classes('text-2xl font-bold mx-auto mt-4')
-            with ui.grid(columns=9).classes('w-full max-w-4xl mx-auto gap-2'):
+            # Alphabet
+            # Alphabet mit automatischem Zeilenumbruch am Ende jeder Zeile
+            max_buchstaben_pro_zeile = 8
+            alphabet_chunks = [ALPHABET[i:i+max_buchstaben_pro_zeile] for i in range(0, len(ALPHABET), max_buchstaben_pro_zeile)]
+            # Dynamisch: Buchstaben pro Zeile, abhängig von Bildschirmbreite
+            with ui.row().classes('w-full max-w-4xl mx-auto flex-wrap gap-2 justify-center'):
                 for buchstabe in ALPHABET:
-                    ui.button(buchstabe, 
-                             on_click=lambda b=buchstabe: self.buchstabe_hinzufuegen(b)).classes(
-                        'text-3xl font-bold p-4 bg-blue-500 text-white rounded-lg w-16 h-16 hover:bg-blue-600')
-            
-            # Starte Timer
+                    ui.button(buchstabe, on_click=lambda b=buchstabe: self.buchstabe_hinzufuegen(b)
+                             ).classes('text-3xl font-bold p-4 bg-blue-500 text-white rounded-lg w-16 h-16')
+            # Start timer
             self.timer_task = asyncio.create_task(self.timer_countdown())
 
-# App initialisieren
-app = LeselernApp()
+# Create app
+app = ReadingApp()
 
 @ui.page('/')
 def startseite():
+    ui.dark_mode().enable() 
     app.erstelle_startseite()
 
 @ui.page('/spiel')
 def spielseite():
+    ui.dark_mode().enable() 
     app.erstelle_spielseite()
 
-# Audio-Cache als statisches Verzeichnis registrieren
-from starlette.staticfiles import StaticFiles
+# Register audio cache
 from nicegui import app as nicegui_app
-
 nicegui_app.add_static_files('/audio_cache', 'audio_cache')
 
-ui.run(title='Leselern-App', port=8080)
+ui.run(title='Word Game', port=8080)

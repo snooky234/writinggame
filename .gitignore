@@ -5,9 +5,15 @@ build/
 dist/
 wheels/
 *.egg-info
+.env
+
 
 # Virtual environments
 .venv
 
 audio_cache
 piper
+
+# Generierte Assets
+assets/*.jpg
+assets/*.png
